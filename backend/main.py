@@ -1,5 +1,8 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Import routers from the `backend` package so uvicorn can resolve them
 from backend.routes import routing, parking, events, translation, webhooks

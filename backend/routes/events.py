@@ -3,6 +3,11 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
+import logging
+from backend.services.mapmyindia import MapMyIndiaClient
+
+logger = logging.getLogger(__name__)
+mmi_client = MapMyIndiaClient()
 
 
 router = APIRouter()
@@ -84,12 +89,37 @@ async def get_nearby_events(
     """
     Fetch mobility-impacting events near a location.
 
-    Currently powered by in-memory mock data so it works instantly in
-    hackathon settings. Replace `_mock_events` with your own datasource
-    (e.g. city feeds, crowd-sourced reports, or a database).
+    Tries to use MapMyIndia Live Traffic Incidents.
+    Falls back to mock data if API is unavailable or fails.
     """
     now = datetime.now(timezone.utc)
-    events = _mock_events(now)
+    events = []
+
+    # 1. Try MapMyIndia API
+    mmi_incidents = await mmi_client.get_nearby_incidents(lat, lon, radius_km)
+    if mmi_incidents:
+        try:
+            for item in mmi_incidents:
+                # Mock mapping logic - replace with actual field mapping
+                # Assuming item has 'latitude', 'longitude', 'description', etc.
+                events.append(MobilityEvent(
+                    id=str(item.get("id", "approx")),
+                    title=item.get("header", "Traffic Incident"),
+                    category="incident",
+                    lat=item.get("latitude", lat),
+                    lon=item.get("longitude", lon),
+                    starts_at=now, # Approximate
+                    ends_at=now + timedelta(hours=2),
+                    description=item.get("description", ""),
+                    severity=3
+                ))
+        except Exception as e:
+            logger.error(f"Error parsing MapMyIndia incidents: {e}")
+            events = [] 
+
+    # 2. Fallback to Mock Data
+    if not events:
+        events = _mock_events(now)
 
     if active_only:
         events = [

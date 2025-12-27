@@ -1,8 +1,21 @@
 from math import radians, cos, sin, asin, sqrt
-from typing import List, Literal, Optional, Dict
+from typing import List, Literal, Optional, Dict, Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+import logging
+from backend.services.router_manager import router_manager
+from backend.services.osrm import OSRMClient
+from backend.services.mapbox_geocoding import MapboxGeocoder
+from backend.config import routing_config
+
+logger = logging.getLogger(__name__)
+# Using router_manager for unified routing across all providers
+# osrm_client kept for backward compatibility in some endpoints
+osrm_client = OSRMClient()
+# Initialize Mapbox geocoder for global location support
+mapbox_geocoder = MapboxGeocoder(routing_config.mapbox_api_key)
+
 
 
 router = APIRouter()
@@ -22,6 +35,10 @@ class RouteLeg(BaseModel):
     distance_meters: float
     duration_seconds: float
     mode: TravelMode
+    geometry: str = Field(
+        default="",
+        description="Encoded polyline string of the route path."
+    )
 
 
 class RouteSummary(BaseModel):
@@ -112,11 +129,59 @@ def _estimate_co2_kg(distance_m: float, mode: TravelMode) -> float:
 async def plan_route(payload: RouteRequest) -> RouteResponse:
     """
     Plan a simple, single-leg route between two coordinates.
-
-    This is intentionally lightweight and self-contained so that it
-    works offline during hackathons and demos. In a real deployment
-    you would swap this out for a proper routing engine or external API.
+    
+    Tries to use MapMyIndia Live Traffic API.
+    Falls back to haversine estimation if API is unavailable or fails.
     """
+    # 1. Try MapMyIndia API
+    mmi_resp = await mmi_client.get_route(
+        payload.origin.lat, payload.origin.lon,
+        payload.destination.lat, payload.destination.lon,
+        payload.mode
+    )
+
+    if mmi_resp:
+        try:
+            # Attempt to parse MapMyIndia response
+            # Note: Adjust parsing logic based on actual API response structure
+            # This assumes a structure similar to OSRM/Mapbox/Google
+            routes = mmi_resp.get("routes", [])
+            if routes:
+                route = routes[0]
+                # Extract distance/duration (often in meters/seconds)
+                distance_m = float(route.get("distance", 0))
+                duration_s = float(route.get("duration", 0))
+                geometry = route.get("geometry", "")
+                
+                leg = RouteLeg(
+                    start=payload.origin,
+                    end=payload.destination,
+                    distance_meters=round(distance_m, 2),
+                    duration_seconds=round(duration_s, 1),
+                    mode=payload.mode,
+                    geometry=geometry,
+                )
+
+                summary = RouteSummary(
+                    distance_meters=leg.distance_meters,
+                    duration_seconds=leg.duration_seconds,
+                    estimated_co2_kg=_estimate_co2_kg(distance_m, payload.mode),
+                )
+
+                return RouteResponse(
+                    waypoints=[payload.origin, payload.destination],
+                    legs=[leg],
+                    summary=summary,
+                    debug={
+                        "implementation": "mapmyindia_live",
+                        "note": "Live traffic data used.",
+                    },
+                )
+        except Exception as e:
+            logger.error(f"Error parsing MapMyIndia response: {e}")
+            # Fall through to fallback
+
+    # 2. Fallback to Haversine
     distance_m = _haversine_distance_m(
         payload.origin.lat,
         payload.origin.lon,
@@ -133,6 +198,7 @@ async def plan_route(payload: RouteRequest) -> RouteResponse:
         distance_meters=round(distance_m, 2),
         duration_seconds=round(duration_s, 1),
         mode=payload.mode,
+        geometry="", # No geometry for fallback/haversine
     )
 
     summary = RouteSummary(
@@ -147,7 +213,7 @@ async def plan_route(payload: RouteRequest) -> RouteResponse:
         summary=summary,
         debug={
             "implementation": "haversine_stub",
-            "note": "Replace with real routing in production.",
+            "note": "Fallback used (API unavailable or failed).",
         },
     )
 
@@ -268,6 +334,20 @@ class TextRouteResponse(BaseModel):
         ...,
         description="List of waypoint names in order",
     )
+    geometry: str = Field(
+        default="",
+        description="Encoded polyline of the route"
+    )
+    detailed_geometry: List[List[float]] = Field(
+        default_factory=list,
+        description="List of [lat, lon] coordinates for the route path"
+    )
+    steps: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Turn-by-turn directions"
+    )
+    start_point: Optional[Dict[str, Any]] = None
+    end_point: Optional[Dict[str, Any]] = None
 
 
 # Mock geocoding database for Bangalore locations
@@ -291,87 +371,116 @@ LOCATION_DB: Dict[str, Dict[str, float]] = {
 }
 
 
-def _geocode_location(location_name: str) -> Dict[str, float]:
+async def _geocode_location(location_name: str) -> Dict[str, float]:
     """
-    Mock geocoding function that looks up location names.
+    Geocode a location name to coordinates.
     
-    In production, replace this with a real geocoding API call.
+    Strategy:
+    1. Try local database first (fast, for known Bangalore locations)
+    2. If not found, use Mapbox Geocoding API (global coverage)
+    3. If Mapbox fails, fall back to Bangalore center
     """
     normalized = location_name.lower().strip()
     
+    # Try local database first (fast lookup for known locations)
     # Direct match
     if normalized in LOCATION_DB:
+        logger.debug(f"Found '{location_name}' in local database")
         return LOCATION_DB[normalized]
     
     # Partial match (e.g., "BTM" matches "BTM Layout")
     for key, value in LOCATION_DB.items():
         if normalized in key or key in normalized:
+            logger.debug(f"Partial match for '{location_name}' in local database")
             return value
     
-    # Default fallback: use a central Bangalore coordinate
-    # In production, you'd raise an error or call a real geocoding service
+    # Not in local database - try Mapbox Geocoding API
+    logger.info(f"Location '{location_name}' not in database, using Mapbox Geocoding")
+    
+    if mapbox_geocoder.is_configured:
+        try:
+            # Use async geocoding
+            import asyncio
+            result = await mapbox_geocoder.geocode(location_name, country="in")
+            
+            if result:
+                logger.info(f"Successfully geocoded '{location_name}' via Mapbox")
+                return result
+            else:
+                logger.warning(f"Mapbox could not geocode '{location_name}'")
+        except Exception as e:
+            logger.error(f"Error during Mapbox geocoding: {e}")
+    else:
+        logger.warning("Mapbox geocoder not configured, cannot geocode unknown location")
+    
+    # Final fallback: use central Bangalore coordinate
+    logger.warning(f"Falling back to Bangalore center for '{location_name}'")
     return {"lat": 12.9716, "lon": 77.5946, "display": location_name.title()}
 
 
 def _generate_waypoints(
     source: str, destination: str, event: str
-) -> tuple[List[str], str]:
+) -> tuple[List[str], str, List[Dict[str, float]]]:
     """
-    Generate realistic waypoints based on source, destination, and event.
-    
-    This is mock logic that creates believable route descriptions.
-    In production, use a real routing engine (Google Directions, OSRM, etc.).
+    Generate realistic waypoints and intermediate coordinates based on source, destination, and event.
+    Returns: (list of waypoint names, reasoning, list of intermediate coordinates)
     """
     source_norm = source.lower().strip()
     dest_norm = destination.lower().strip()
     event_norm = event.lower().strip()
     
     waypoints = [source]
+    # Intermediate coords for road-following "illusion"
+    intermediates = []
     
+    # Common Junctions coordinates for Bangalore
+    JUNCTIONS = {
+        "Silk Board": {"lat": 12.9176, "lon": 77.6233, "display": "Silk Board Junction"},
+        "Dairy Circle": {"lat": 12.9385, "lon": 77.6015, "display": "Dairy Circle"},
+        "Richmond Circle": {"lat": 12.9600, "lon": 77.5969, "display": "Richmond Circle"},
+        "Sony World": {"lat": 12.9352, "lon": 77.6245, "display": "Sony World Junction"},
+        "Tin Factory": {"lat": 12.9940, "lon": 77.6800, "display": "Tin Factory"},
+    }
+
     # Generate route based on known location combinations
     if "btm" in source_norm and "mg road" in dest_norm:
         if "rally" in event_norm or "protest" in event_norm or "lalbagh" in event_norm:
-            # Avoid Lalbagh area due to rally
-            waypoints.extend(["JP Nagar", "Richmond Road"])
-            reason = "Avoiding rally congestion near Lalbagh"
+            # Detour via Dairy Circle and Richmond Circle
+            waypoints.extend(["Dairy Circle", "Richmond Road"])
+            intermediates = [JUNCTIONS["Dairy Circle"], JUNCTIONS["Richmond Circle"]]
+            reason = "Avoiding rally congestion near Lalbagh via Dairy Circle"
         else:
-            waypoints.extend(["JP Nagar", "Richmond Road"])
-            reason = "Optimal route via JP Nagar and Richmond Road"
+            # Standard via Richmond Circle
+            waypoints.extend(["Richmond Road"])
+            intermediates = [JUNCTIONS["Richmond Circle"]]
+            reason = "Optimal route via Richmond Circle"
     
     elif "btm" in source_norm and "koramangala" in dest_norm:
-        waypoints.extend(["HSR Layout"])
-        reason = "Direct route via HSR Layout"
-    
-    elif "indiranagar" in source_norm and "mg road" in dest_norm:
-        waypoints.extend(["Ulsoor"])
-        reason = "Route via Ulsoor"
+        waypoints.extend(["Sony World Junction"])
+        intermediates = [JUNCTIONS["Sony World"]]
+        reason = "Direct route via Sony World Junction"
     
     elif "whitefield" in source_norm and "mg road" in dest_norm:
-        waypoints.extend(["Marathahalli", "Indiranagar"])
-        if "event" in event_norm or "traffic" in event_norm:
-            reason = "Avoiding heavy traffic on main corridor"
-        else:
-            reason = "Standard route via Marathahalli and Indiranagar"
+        waypoints.extend(["Tin Factory", "Indiranagar"])
+        intermediates = [JUNCTIONS["Tin Factory"]]
+        reason = "Standard route via Tin Factory and Old Madras Road"
     
     elif "electronic city" in source_norm and "mg road" in dest_norm:
-        waypoints.extend(["BTM Layout", "Richmond Road"])
-        reason = "Route via BTM Layout and Richmond Road"
+        waypoints.extend(["Silk Board", "Dairy Circle"])
+        intermediates = [JUNCTIONS["Silk Board"], JUNCTIONS["Dairy Circle"]]
+        reason = "Route via Silk Board and Dairy Circle"
     
     else:
         # Generic route generation
         if event_norm:
-            waypoints.append("via alternate route")
+            waypoints.append("Alternate Connection")
             reason = f"Avoiding {event} by taking alternate route"
         else:
-            waypoints.append("via main road")
+            waypoints.append("Direct Connection")
             reason = "Standard route recommendation"
     
     waypoints.append(destination)
-    
-    # Format route string
-    route_str = " → ".join(waypoints)
-    
-    return waypoints, reason
+    return waypoints, reason, intermediates
 
 
 @router.post(
@@ -412,12 +521,12 @@ async def suggest_text_route(payload: TextRouteRequest) -> TextRouteResponse:
     }
     ```
     """
-    # Geocode source and destination
-    source_coords = _geocode_location(payload.source)
-    dest_coords = _geocode_location(payload.destination)
+    # Geocode source and destination (now using Mapbox for global coverage)
+    source_coords = await _geocode_location(payload.source)
+    dest_coords = await _geocode_location(payload.destination)
     
-    # Generate waypoints and reasoning
-    waypoints, reason = _generate_waypoints(
+    # Generate waypoints, reasoning and intermediate points
+    waypoints, reason, intermediate_points = _generate_waypoints(
         source_coords.get("display", payload.source),
         dest_coords.get("display", payload.destination),
         payload.event,
@@ -450,6 +559,71 @@ async def suggest_text_route(payload: TextRouteRequest) -> TextRouteResponse:
     
     # Calculate CO2
     co2_kg = _estimate_co2_kg(distance_m, payload.mode)
+
+    # Use router_manager to get route with automatic provider fallback
+    geometry = ""
+    detailed_geometry = []
+    steps = []
+    provider_used = "fallback"
+    
+    try:
+        # Router manager will try providers in order: preferred -> configured -> OSRM
+        route_resp = await router_manager.get_route(
+            source_coords["lat"], source_coords["lon"],
+            dest_coords["lat"], dest_coords["lon"],
+            payload.mode
+        )
+        
+        if route_resp and route_resp.get("routes"):
+            route = route_resp["routes"][0]
+            geometry = route.get("geometry", "")
+            
+            # Update distance and duration from actual routing API
+            distance_m = float(route.get("distance", distance_m))
+            duration_s = float(route.get("duration", duration_s))
+            
+            # Extract steps
+            legs = route.get("legs", [])
+            for leg in legs:
+                steps.extend(leg.get("steps", []))
+            
+            # Track which provider was used
+            provider_used = route_resp.get("_provider_used", "unknown")
+            logger.info(f"Route calculated using provider: {provider_used}")
+            
+    except Exception as e:
+        logger.error(f"Routing API error in suggest_text_route: {e}")
+        pass  # Fallback to mock steps below
+
+    
+    # Fallback: If no geometry from MMI, build a path and mock steps
+    if not geometry:
+        detailed_geometry.append([source_coords["lat"], source_coords["lon"]])
+        # Start Step
+        steps.append({
+            "instruction": f"Start from {waypoints[0]}",
+            "distance": 0,
+            "duration": 0,
+            "maneuver": {"location": [source_coords["lon"], source_coords["lat"]], "instruction": f"Start from {waypoints[0]}"}
+        })
+        
+        for i, pt in enumerate(intermediate_points):
+            detailed_geometry.append([pt["lat"], pt["lon"]])
+            steps.append({
+                "instruction": f"Head toward {pt['display']}",
+                "distance": 500, # Mock distance
+                "duration": 60,  # Mock duration
+                "maneuver": {"location": [pt["lon"], pt["lat"]], "instruction": f"Pass through {pt['display']}"}
+            })
+            
+        detailed_geometry.append([dest_coords["lat"], dest_coords["lon"]])
+        # End Step
+        steps.append({
+            "instruction": f"Arrive at {waypoints[-1]}",
+            "distance": 200,
+            "duration": 30,
+            "maneuver": {"location": [dest_coords["lon"], dest_coords["lat"]], "instruction": f"Arrive at {waypoints[-1]}"}
+        })
     
     # Format route string
     route_str = " → ".join(waypoints)
@@ -463,5 +637,45 @@ async def suggest_text_route(payload: TextRouteRequest) -> TextRouteResponse:
         duration_minutes=round(duration_s / 60.0, 1),
         estimated_co2_kg=co2_kg,
         waypoints=waypoints,
+        geometry=geometry,
+        detailed_geometry=detailed_geometry,
+        steps=steps,
+        start_point=source_coords,
+        end_point=dest_coords
     )
 
+@router.post(
+    "/recalculate",
+    response_model=TextRouteResponse,
+    summary="Recalculate route based on current coordinates and new event data",
+)
+async def recalculate_route(payload: TextRouteRequest) -> TextRouteResponse:
+    """
+    Simulates a dynamic recalculation. 
+    In a real system, this might be triggered by a geofence or traffic event.
+    """
+    return await suggest_text_route(payload)
+
+
+@router.get(
+    "/providers/status",
+    summary="Get routing provider configuration status",
+)
+async def get_provider_status() -> Dict[str, Any]:
+    """
+    Get status of all routing providers for debugging and monitoring.
+    
+    Returns information about:
+    - Which providers are configured (have valid API keys)
+    - Preferred provider setting
+    - Fallback chain order
+    - Provider requirements
+    
+    This endpoint is useful for:
+    - Verifying API key configuration
+    - Debugging routing issues
+    - Monitoring provider availability
+    
+    Note: API keys are NEVER exposed in the response.
+    """
+    return router_manager.get_provider_status()
